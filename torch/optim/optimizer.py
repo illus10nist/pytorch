@@ -1,4 +1,4 @@
-from collections import defaultdict
+from collections import defaultdict, Iterable
 
 import torch
 from copy import deepcopy
@@ -96,8 +96,19 @@ class Optimizer(object):
         id_map = {old_id: p for old_id, p in
                   zip(chain(*(g['params'] for g in saved_groups)),
                       chain(*(g['params'] for g in groups)))}
+        def cast(param, value):
+            """Make a deep copy of value, casting all tensors to device of param."""
+            if torch.is_tensor(value):
+                value = value.cuda(param.get_device()) if param.is_cuda else value.cpu()
+                return value.clone()
+            elif isinstance(value, dict):
+                return {k: cast(param, v) for k, v in value.items()}
+            elif isinstance(value, Iterable):
+                return type(value)(cast(param, v) for v in value)
+            else:
+                return value
         state = defaultdict(
-            dict, {id_map.get(k, k): v for k, v in state_dict['state'].items()})
+            dict, {id_map[k]: cast(id_map[k], v) for k, v in state_dict['state'].items()})
 
         # Update parameter groups, setting their 'params' value
         def update_group(group, new_group):

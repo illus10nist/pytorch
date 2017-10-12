@@ -159,6 +159,22 @@ class TestOptim(TestCase):
         # Make sure state dict wasn't modified
         self.assertEqual(state_dict, state_dict_c)
 
+        if not torch.cuda.is_available():
+            return
+        weight_cuda = Variable(weight.data.cuda(), requires_grad=True)
+        bias_cuda = Variable(bias.data.cuda(), requires_grad=True)
+        optimizer_cuda = constructor(weight_cuda, bias_cuda)
+        fn_cuda = functools.partial(fn_base, optimizer_cuda, weight_cuda, bias_cuda)
+        optimizer_cuda.load_state_dict(optimizer)
+        for i in range(20):
+            optimizer.step(fn)
+            optimizer_c.step(fn_c)
+            self.assertEqual(weight, weight_cuda)
+            self.assertEqual(bias, bias_cuda)
+        # Make sure state dict wasn't modified
+        self.assertEqual(state_dict, state_dict_cuda)
+
+
     def _test_basic_cases(self, constructor, ignore_multidevice=False):
         self._test_state_dict(
             torch.randn(10, 5),
