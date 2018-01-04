@@ -1,10 +1,10 @@
-import torch.autograd.function as function
 import torch._C
 from torch import Tensor
-from torch.autograd import Variable
+from torch.autograd import Variable, function
 from torch.nn import Module, ParameterList, Parameter
 from torch._six import raise_from
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
+import sys
 import warnings
 import itertools
 import types
@@ -17,6 +17,30 @@ import copy
 
 _flatten = torch._C._jit_flatten
 _unflatten = torch._C._jit_unflatten
+
+
+# This global variable is set when we are tracing a *forwards* computation.
+# It is intended to be a cheap way to test if tracing has occurred, before
+# doing the slower path using `get_tracing_state` (below.)
+_tracing = False
+
+
+def get_tracing_state(args):
+    if not torch._C._is_tracing(args):
+        return None
+    return torch._C._get_tracing_state(args)
+
+
+@contextlib.contextmanager
+def scope(scope_name, *vars):
+    tracing_state = get_tracing_state(vars)
+    if tracing_state:
+        tracing_state.push_scope(scope_name)
+    try:
+        yield
+    finally:
+        if tracing_state:
+            tracing_state.pop_scope()
 
 
 def compile(arg=None, nderivs=1, optimize=True, enabled=True):
@@ -110,31 +134,6 @@ def compile(arg=None, nderivs=1, optimize=True, enabled=True):
     """
     def _compile(arg):
         if inspect.isclass(arg):
-            class CompiledModuleMeta(type):
-                def __call__(cls, *args, **kwargs):
-                    # NOTE: this is called whenever an instance of this class is created
-                    # The super call below will call __new__ and __init__, and we will
-                    # patch things later.
-                    try:
-                        obj = super(CompiledModuleMeta, cls).__call__(*args, **kwargs)
-                    except TypeError as e:
-                        # If this fails here, the user probably didn't use this as a class decorator
-                        if "super" in str(e):
-                            raise_from(TypeError("torch.jit.compile must be used as a class decorator; "
-                                                 "using it on an already defined class is not valid."
-                                                 "\n\nOriginal error: {}".format(str(e))), e)
-                        else:
-                            raise
-
-                    compiled_fn = torch._C.CompiledFunction(nderivs, optimize,
-                                                            obj.forward,
-                                                            arg.__name__)
-                    compiled_fn.enabled = enabled
-                    obj.compiled_fn = compiled_fn
-                    obj.forward = lambda *args: compiled_fn(args, list(obj.parameters()))
-                    obj.has_trace_for = lambda *args: compiled_fn.has_trace_for(args, list(obj.parameters()))
-                    return obj
-
             # NB: It might seem natural to create a subclass here, rather than
             # make a copy of the class to insert the mixin.  Unfortunately, this
             # will break many user classes.  Suppose you have:
@@ -155,9 +154,43 @@ def compile(arg=None, nderivs=1, optimize=True, enabled=True):
             # user passed in), this problem goes away, because the class
             # __init__ is a part of is indeed Foo.
 
+            old_init = arg.__init__
+            # Python 2 has a concept of unbound methods, which are returned when
+            # you take a method form a class. They behave just like regular functions,
+            # but check the type of the first argument (self). We don't want this here,
+            # because self in our __init__ will be an instance of this new class.
+            # Python 3 already returns a plain function, so nothing has to be done.
+            if sys.version_info[0] == 2:
+                old_init = old_init.im_func
+
+            def __init__(self, *args, **kwargs):
+                torch._C.CompiledFunction.__init__(self,
+                                                   nderivs, optimize, enabled,
+                                                   self.forward,
+                                                   arg.__name__)
+                try:
+                    old_init(self, *args, **kwargs)
+                except TypeError as e:
+                    # If this fails here, the user probably didn't use this as a class decorator
+                    if "super" in str(e):
+                        raise_from(TypeError("torch.jit.compile must be used as a class decorator; "
+                                             "using it on an already defined class is not valid."
+                                             "\n\nOriginal error: {}".format(str(e))), e)
+                    else:
+                        raise
+                # NOTE: This can't be done in CompiledFunction constructor,
+                # because self.parameters() isn't well defined by then
+                # (Module constructor hasn't run yet).
+                self.set_captured_vars(list(self.parameters()))
+
+            new_dict = dict(arg.__dict__)
+            new_dict['__init__'] = __init__
+            new_dict['__call__'] = torch._C.CompiledFunction.__call__
+            # NOTE: we don't need to override casting methods, because we only capture
+            # parameters, and they mutate their data in-place.
             return type(arg.__name__,
-                        (torch._six.with_metaclass(CompiledModuleMeta, *arg.__bases__),),
-                        dict(arg.__dict__))
+                        arg.__bases__ + (torch._C.CompiledFunction,),
+                        new_dict)
         elif isinstance(arg, Module):
             # It requires work to compile module instances, because you would
             # like the resulting compiled module to look just like the uncompiled
@@ -166,8 +199,9 @@ def compile(arg=None, nderivs=1, optimize=True, enabled=True):
             raise TypeError("Compiling model instances is not supported.  "
                             "Use @torch.jit.compile on a class instead.")
         elif callable(arg):
-            module = type(arg.__name__, (torch.nn.Module,), {'forward': lambda self, *args: arg(*args)})
-            return _compile(module)()
+            compiled_fn = torch._C.CompiledFunction(nderivs, optimize, enabled,
+                                                    arg, arg.__name__)
+            return compiled_fn
         else:
             raise TypeError("Cannot handle arg with type {}".format(type(arg)))
     # Make empty parenthesis optional
@@ -217,6 +251,18 @@ def trace(f, args=tuple(), kwargs=None, nderivs=0):
     return TracedModule(f, nderivs=nderivs)(*args, **kwargs)
 
 
+def _unique_state_dict(module, keep_vars=False):
+    state_dict = module.state_dict(keep_vars=keep_vars)
+    filtered_dict = type(state_dict)()
+    seen_ids = set()
+    for k, v in state_dict.items():
+        if id(v) in seen_ids:
+            continue
+        seen_ids.add(id(v))
+        filtered_dict[k] = v
+    return filtered_dict
+
+
 class TracedModule(Module):
     def __init__(self, inner, nderivs=0):
         super(TracedModule, self).__init__()
@@ -227,18 +273,19 @@ class TracedModule(Module):
         self.nderivs = nderivs
 
     def forward(self, *args):
-        in_vars, _, _ = _flatten((args, list(self.parameters())))
-        return _get_trace(self.inner, args, in_vars, self.nderivs)
-
-
-# Functional version that assumes that all parameters are explicitly
-# specified
-def _get_trace(f, args, in_vars, nderivs=0):
-    trace = torch._C._tracer_enter(in_vars, nderivs)
-    out = f(*args)
-    out_vars, _, _ = _flatten(out)
-    torch._C._tracer_exit(out_vars)
-    return trace, out
+        global _tracing
+        in_vars, in_desc = _flatten(args)
+        # NOTE: use full state, because we need it for BatchNorm export
+        # This differs from the compiler path, which doesn't support it at the moment.
+        module_state = list(_unique_state_dict(self, keep_vars=True).values())
+        trace, all_trace_inputs = torch._C._tracer_enter(in_vars + module_state, self.nderivs)
+        _tracing = True
+        trace_inputs = _unflatten(all_trace_inputs[:len(in_vars)], in_desc)
+        out = self.inner(*trace_inputs)
+        out_vars, _ = _flatten(out)
+        _tracing = False
+        torch._C._tracer_exit(out_vars)
+        return trace, out
 
 
 def _clone_inputs(args):
@@ -246,14 +293,14 @@ def _clone_inputs(args):
         if a is None:
             return None
         elif isinstance(a, Variable):
-            v = Variable(a.data.clone(), requires_grad=a.requires_grad, volatile=a.volatile)
+            v = Variable(a.data.clone(), requires_grad=a.requires_grad)
             if a.grad is not None:
                 v.grad = clone_input(v.grad)
             return v
         else:
             return a.clone()
     return function._nested_map(lambda o: isinstance(o, Variable) or torch.is_tensor(o),
-                                clone_input)(args)
+                                clone_input, condition_msg="Variables")(args)
 
 
 # This is purely for developer debugging.  We are not going to advertise it.
@@ -328,19 +375,22 @@ def verify(model, args, loss_fn=torch.sum, devices=None):
 
     # TODO: Consider adding a utility function to torch.jit to test
     # for this case
-    if not hasattr(model, 'compiled_fn') or not isinstance(model.compiled_fn, torch._C.CompiledFunction):
+    if not isinstance(model, torch._C.CompiledFunction):
         raise TypeError("Cannot verify an uncompiled module.  Add @torch.jit.compile to compile it")
+    is_module = isinstance(model, Module)
 
     if not isinstance(args, tuple):
         args = (args,)
 
     saved_args = _clone_inputs(args)
-    saved_state = copy.deepcopy(model.state_dict())
+    if is_module:
+        saved_state = copy.deepcopy(model.state_dict())
 
     def run_fwd_bwd(args, force_trace=False, assert_compiled=False):
-        in_vars, _, _ = _flatten((args, list(model.parameters())))
+        params = list(model.parameters()) if is_module else []
+        in_vars, _ = _flatten((args, params))
         # We use a special API to reset the trace and compile it from scratch.
-        compiled_fn = model.compiled_fn
+        compiled_fn = model
         if force_trace:
             compiled_fn.clear_cache()
         if assert_compiled:
@@ -353,7 +403,7 @@ def verify(model, args, loss_fn=torch.sum, devices=None):
         if loss_fn == torch.sum and len(out) != 1:
             raise ValueError(("Model returns {} outputs, but default loss function "
                              "(torch.sum) can only handle a single output").format(len(out)))
-        out_vars, _, _ = _flatten(out)
+        out_vars, _ = _flatten(out)
         saved_outs = [v.data.clone() for v in out_vars]
         loss = loss_fn(*out)
         grads = torch.autograd.grad([loss], in_vars)
@@ -365,7 +415,8 @@ def verify(model, args, loss_fn=torch.sum, devices=None):
         uncompiled_outs, uncompiled_grads = run_fwd_bwd(args, force_trace=True)
         assert model.has_trace_for(*args)
 
-    model.load_state_dict(saved_state)
+    if is_module:
+        model.load_state_dict(saved_state)
     compiled_outs, compiled_grads = run_fwd_bwd(args, assert_compiled=True)
 
     _verify_equal(uncompiled_outs, compiled_outs)

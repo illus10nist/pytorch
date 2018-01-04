@@ -164,6 +164,70 @@
 ]]
 
 [[
+  name: digamma
+  types:
+    - floating_point
+  backends:
+    - CPU
+    - CUDA
+  variants:
+    - method
+    - function
+  return: argument 0
+  arguments:
+    - arg: THTensor* result
+      output: True
+    - THTensor* self
+]]
+
+[[
+  name: digamma_
+  types:
+    - floating_point
+  backends:
+    - CPU
+    - CUDA
+  cname: digamma
+  return: self
+  arguments:
+    - THTensor* self
+    - THTensor* self
+]]
+
+[[
+  name: polygamma
+  types:
+    - floating_point
+  backends:
+    - CPU
+    - CUDA
+  variants:
+    - method
+    - function
+  return: argument 0
+  arguments:
+    - arg: THTensor* result
+      output: True
+    - int64_t n
+    - THTensor* self
+]]
+
+[[
+  name: polygamma_
+  types:
+    - floating_point
+  backends:
+    - CPU
+    - CUDA
+  cname: polygamma
+  return: self
+  arguments:
+    - THTensor* self
+    - int64_t n
+    - THTensor* self
+]]
+
+[[
   name: exp_
   types:
     - floating_point
@@ -194,6 +258,36 @@
     - THTensor* self
 ]]
 
+[[
+  name: expm1_
+  types:
+    - floating_point
+  backends:
+    - CPU
+    - CUDA
+  cname: expm1
+  return: self
+  arguments:
+    - THTensor* self
+    - THTensor* self
+]]
+
+[[
+  name: expm1
+  types:
+    - floating_point
+  backends:
+    - CPU
+    - CUDA
+  variants:
+    - method
+    - function
+  return: argument 0
+  arguments:
+    - arg: THTensor* result
+      output: True
+    - THTensor* self
+]]
 
 [[
   name: cos_
@@ -1039,11 +1133,6 @@
 
 [[
   name: neg
-  types:
-    - floating_point
-    - Long
-    - Int
-    - Short
   backends:
     - CPU
     - CUDA
@@ -1061,11 +1150,6 @@
 
 [[
   name: neg_
-  types:
-    - floating_point
-    - Long
-    - Int
-    - Short
   backends:
     - CPU
     - CUDA
@@ -1080,12 +1164,10 @@
 [[
   name: atan2
   types:
-    - Float
-    - Double
+    - floating_point
   backends:
     - CPU
-  backend_type_pairs: [[CPU,Float],[CPU,Double],[CUDA,Float]]
-
+    - CUDA
   variants:
     - method
     - function
@@ -1101,7 +1183,11 @@
 
 [[
   name: atan2_
-  backend_type_pairs: [[CPU,Float],[CPU,Double],[CUDA,Float]]
+  types:
+    - floating_point
+  backends:
+    - CPU
+    - CUDA
   cname: atan2
   return: argument 0
   arguments:
@@ -2555,6 +2641,7 @@ static const char *R = &__R;
     - Double
   backends:
     - CPU
+    - CUDA
   variants:
     - method
     - function
@@ -2632,6 +2719,31 @@ static const char *R = &__R;
     - arg: THIntegerTensor* info
       kwarg_only: True
       default: NULL
+    - arg: bool pivot
+      kwarg_only: True
+      default: "true"
+    - THTensor* self
+]]
+
+[[
+  name: btrifact_with_info
+  cname: btrifact
+  types:
+    - floating_point
+  backends:
+    - CPU
+    - CUDA
+  variants:
+    - method
+    - function
+  return: argument 0,1,2
+  arguments:
+    - arg: THTensor* result
+      output: True
+    - arg: THIntegerTensor* pivots
+      output: True
+    - arg: THIntegerTensor* info
+      output: True
     - arg: bool pivot
       kwarg_only: True
       default: "true"
